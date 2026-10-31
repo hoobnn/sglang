@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 from array import array
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from datetime import timedelta
 from queue import Queue
@@ -38,6 +38,8 @@ from sglang.srt.mem_cache.unified_cache.storage_agreement import (
     attention_group_min,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
+    _RESERVE_DONE,
+    _RESERVE_SHORT,
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
@@ -358,6 +360,239 @@ class TestStorageAgreementTransfers(unittest.TestCase):
         self.assertEqual(plain.completed_tokens, 2)
         self.assertTrue(plain.pool_transfers_done)
         self.assertEqual(plain.pool_storage_result.extra_pool_hit_pages, {})
+
+
+class TestAgreedHitReservations(unittest.TestCase):
+    """The hit drain reserves locally, agrees the outcomes in one MIN, and only
+    then dispatches: a peer's shortfall parks the operation here too, and a
+    parked hit keeps its turn."""
+
+    def _cache(self, peer_outcomes):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.host_memory_mode = "buffer_only"
+        cache.prefetch_threshold = PAGE
+        cache.enable_storage_metrics = False
+        cache.storage_metrics_collector = None
+        cache.storage_prefetch_retries = StoragePrefetchRetries()
+        cache._storage_prefetch_wait = {}
+        cache._prefetch_outcome_stats = defaultdict(int)
+        cache._storage_prefetch_hit_remaining_by_reqid = {}
+        cache._record_storage_prefetch_hit = Mock()
+        cache.revoke_pending_prefetch = Mock()
+        cache._invalidate_absent_from_hit_query = Mock()
+        cache._account_prefetch_outcome = Mock()
+        cache._trim_buffer_prefetch_full_head = (
+            lambda request, info, operation, full, hit: (info, hit, hit)
+        )
+        cache.storage_engine = object()  # agreement on
+        dispatched, rolled_back = [], []
+        pipeline = SimpleNamespace(
+            pending_hit_allocs=deque(),
+            try_lock_anchor=lambda request, tokens: ("locked", 0),
+            staged_span_covered=lambda request, tokens: False,
+            reserve_prefetch=lambda operation, info, hit, aux: "reserved",
+            dispatch_reserved_prefetch=dispatched.append,
+            rollback_reserved_prefetch=rolled_back.append,
+            release_anchor_lock=lambda request: None,
+        )
+        cache.buffer_pipeline = pipeline
+        cache.cache_controller = SimpleNamespace(
+            prefetch_hit_queue=Queue(),
+            ack_prefetch_queue=Queue(),
+            ack_backup_queue=Queue(),
+            host_mem_release_queue=Queue(),
+            extra_host_mem_release_queues={},
+            prefetch_rate_limited=lambda: False,
+        )
+        cache.ongoing_prefetch = {}
+
+        def reduce_min(tensor, op):
+            # One row per outcome agreed in this drain; tests edit the list.
+            peer = torch.tensor(peer_outcomes, dtype=torch.int64)
+            torch.minimum(tensor, peer, out=tensor)
+
+        cache._all_reduce_attn_groups = reduce_min
+        return cache, pipeline, dispatched, rolled_back
+
+    def _hit(self, cache, rid):
+        operation = _operation(rid)
+        operation.storage_hit_count = len(TOKENS)
+        operation.hash_value = list(CHAIN)
+        cache.ongoing_prefetch[operation.handle] = _OngoingPrefetch(
+            0, RadixKey(array("q", TOKENS)), None, operation, None, {}
+        )
+        cache.cache_controller.prefetch_hit_queue.put(operation)
+        return operation
+
+    def _drain(self, cache, hits):
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=hits,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts=None,
+            log_metrics=False,
+        )
+
+    def test_shortfall_parks_in_order_and_parked_hits_dispatch_once_agreed(self):
+        reserved = [1, len(TOKENS)]
+        # The peer is short on a and reserved b: both park here, in order.
+        peer = [[0, 0], list(reserved)]
+        cache, pipeline, dispatched, rolled_back = self._cache(peer)
+        a, b = self._hit(cache, "a"), self._hit(cache, "b")
+        self._drain(cache, 2)
+        self.assertEqual(rolled_back, [a, b])
+        self.assertEqual(dispatched, [])
+        self.assertEqual(list(pipeline.pending_hit_allocs), [a, b])
+        self.assertEqual(cache._prefetch_outcome_stats["declined_rate_limited"], 2)
+
+        # Room on the peer: the parked hits are retried first and dispatch in order.
+        peer[:] = [list(reserved), list(reserved)]
+        self._drain(cache, 0)
+        self.assertEqual(dispatched, [a, b])
+        self.assertFalse(pipeline.pending_hit_allocs)
+
+        # A local shortfall parks without a rollback and keeps its turn ahead
+        # of the next hit; once reserved everywhere both dispatch in order.
+        pipeline.reserve_prefetch = lambda operation, info, hit, aux: "short"
+        peer[:] = [list(reserved)]
+        c = self._hit(cache, "c")
+        self._drain(cache, 1)
+        self.assertEqual((rolled_back, dispatched), ([a, b], [a, b]))
+        self.assertEqual(list(pipeline.pending_hit_allocs), [c])
+        pipeline.reserve_prefetch = lambda operation, info, hit, aux: "reserved"
+        peer[:] = [list(reserved), list(reserved)]
+        d = self._hit(cache, "d")
+        self._drain(cache, 1)
+        self.assertEqual(dispatched, [a, b, c, d])
+        self.assertFalse(pipeline.pending_hit_allocs)
+        self.assertEqual(cache._prefetch_outcome_stats["declined_rate_limited"], 3)
+
+    def _cache_mode(self, peer_outcomes):
+        """host_memory_mode "cache": the hit is staged in the resident host
+        pool, with no pipeline and no parking. A peer's shorter reservation
+        trims this rank's allocation; an agreed shortfall revokes the prefetch.
+        The whole hit fits locally, so the peer decides how much launches."""
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.host_memory_mode = "cache"
+        cache.buffer_pipeline = None
+        cache.tree_core = SimpleNamespace(page_size=PAGE)
+        cache.prefetch_threshold = PAGE
+        cache.enable_storage_metrics = False
+        cache.storage_metrics_collector = None
+        cache.evict_host = Mock()
+        cache.storage_prefetch_retries = Mock(spec=StoragePrefetchRetries)
+        cache._storage_prefetch_wait = {}
+        cache._prefetch_outcome_stats = defaultdict(int)
+        cache._storage_prefetch_hit_remaining_by_reqid = {}
+        cache._record_storage_prefetch_hit = Mock()
+        cache._resolve_storage_prefetch_tokens = Mock()
+        cache._finish_storage_prefetch = Mock()
+        cache._log_storage_prefetch_deferred = Mock()
+        cache.revoke_pending_prefetch = Mock()
+        cache._invalidate_absent_from_hit_query = Mock()
+        cache._account_prefetch_outcome = Mock()
+        cache.storage_engine = object()  # agreement on
+        dispatched, freed_kv, rolled_back = [], [], []
+        cache.cache_controller = SimpleNamespace(
+            prefetch_hit_queue=Queue(),
+            ack_prefetch_queue=Queue(),
+            ack_backup_queue=Queue(),
+            host_mem_release_queue=Queue(),
+            extra_host_mem_release_queues={},
+            allocate_storage_hit=lambda operation, hit_tokens, **kwargs: (
+                torch.arange(hit_tokens),
+                hit_tokens,
+            ),
+            mem_pool_host=SimpleNamespace(free=freed_kv.append),
+            free_prefetch_host_buffers=lambda operation, host_indices: (
+                rolled_back.append((operation, host_indices))
+            ),
+            dispatch_prefetch_transfer=dispatched.append,
+        )
+        cache.ongoing_prefetch = {}
+
+        def reduce_min(tensor, op):
+            peer = torch.tensor(peer_outcomes, dtype=torch.int64)
+            torch.minimum(tensor, peer, out=tensor)
+
+        cache._all_reduce_attn_groups = reduce_min
+        return cache, dispatched, freed_kv, rolled_back
+
+    def test_cache_mode_trims_the_allocation_to_the_agreed_prefix(self):
+        # The peer could stage only the first two pages of the four-page hit.
+        agreed = 2 * PAGE
+        cache, dispatched, freed_kv, rolled_back = self._cache_mode(
+            [[_RESERVE_DONE, agreed]]
+        )
+        a = self._hit(cache, "a")
+        self._drain(cache, 1)
+
+        # The excess KV rows go back to the pool before the transfer launches;
+        # the reservation itself is not rolled back.
+        self.assertEqual(len(freed_kv), 1)
+        self.assertTrue(torch.equal(freed_kv[0], torch.arange(agreed, len(TOKENS))))
+        self.assertEqual(rolled_back, [])
+        # The dispatched operation and its tracking entry describe the agreed
+        # prefix only.
+        self.assertEqual(dispatched, [a])
+        self.assertEqual(a.storage_hit_count, agreed)
+        self.assertEqual(a.hash_value, CHAIN[: agreed // PAGE])
+        self.assertTrue(torch.equal(a.host_indices, torch.arange(agreed)))
+        self.assertTrue(
+            torch.equal(
+                cache.ongoing_prefetch[a.handle].host_indices, torch.arange(agreed)
+            )
+        )
+        # The trimmed tokens are unfulfilled for want of host capacity; the
+        # prefetch stays alive, so nothing is revoked or retried.
+        cache._resolve_storage_prefetch_tokens.assert_called_once_with(
+            a.handle, len(TOKENS) - agreed, reason="host_capacity"
+        )
+        cache._finish_storage_prefetch.assert_not_called()
+        cache.revoke_pending_prefetch.assert_not_called()
+        cache.storage_prefetch_retries.poll_miss.assert_not_called()
+
+    def test_cache_mode_agreed_shortfall_frees_everything_and_revokes(self):
+        cache, dispatched, freed_kv, rolled_back = self._cache_mode(
+            [[_RESERVE_SHORT, 0]]
+        )
+        a = self._hit(cache, "a")
+        self._drain(cache, 1)
+
+        # This rank reserved the whole hit; the peer's shortfall gives all of
+        # it back through the rollback path and launches nothing.
+        self.assertEqual(dispatched, [])
+        self.assertEqual(freed_kv, [])
+        ((operation, host_indices),) = rolled_back
+        self.assertIs(operation, a)
+        self.assertTrue(torch.equal(host_indices, torch.arange(len(TOKENS))))
+        self.assertIsNone(a.host_indices)
+        self.assertEqual(a.storage_hit_count, len(TOKENS))
+        self.assertEqual(a.hash_value, CHAIN)
+        # Cache mode does not park: the whole hit is unfulfilled for host
+        # capacity, the prefetch is revoked and the request polls the miss at
+        # the hit's end.
+        cache._finish_storage_prefetch.assert_called_once_with(
+            a.handle, fulfilled_tokens=0, reason="host_capacity"
+        )
+        cache._log_storage_prefetch_deferred.assert_called_once_with(
+            len(TOKENS), "host_capacity"
+        )
+        cache.revoke_pending_prefetch.assert_called_once_with(a.handle)
+        cache.storage_prefetch_retries.poll_miss.assert_called_once_with(
+            "a", a.storage_start + len(TOKENS)
+        )
+        cache._resolve_storage_prefetch_tokens.assert_not_called()
+
+    def test_settled_outcome_must_match_the_peers(self):
+        # This rank declines (span device-covered) while the peer reserved:
+        # the tree state is no longer lockstep, which is fatal, not a park.
+        cache, pipeline, *_ = self._cache([[1, len(TOKENS)]])
+        pipeline.staged_span_covered = lambda request, tokens: True
+        self._hit(cache, "a")
+        with self.assertRaisesRegex(RuntimeError, "diverged"):
+            self._drain(cache, 1)
 
 
 # ---------------------------------------------------------------- two ranks

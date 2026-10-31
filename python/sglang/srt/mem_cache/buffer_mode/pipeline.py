@@ -1246,37 +1246,63 @@ class BufferModePipeline:
 
     # ---- load back pipeline (storage -> staging -> device) ----
 
-    def allocate_and_queue_prefetch(
+    def reserve_prefetch(
         self,
         operation: PrefetchOperation,
         info: _OngoingPrefetch,
         hit_tokens: int,
         aux_hit_tokens: int,
-    ) -> bool:
-        """Allocate the hit-sized bounce and queue its storage read.
+    ) -> str:
+        """Allocate the hit-sized bounce without starting the read.
 
-        False parks the operation for another allocation attempt; True means
-        the operation was queued or declined.
+        "reserved": the rows are held and the read can be dispatched (or the
+        reservation rolled back); "short": staging pressure defers the
+        allocation, nothing is held; "settled": the operation was declined.
+        The scheduler agrees the outcome across ranks before dispatching, so
+        a rank that could not allocate parks the operation on every rank.
+        Subclasses customize the hit path by overriding this method,
+        ``dispatch_reserved_prefetch`` and ``rollback_reserved_prefetch``;
+        the drain calls nothing else.
         """
         cache = self._cache
         cc = cache.cache_controller
         if self._reject_oversized_prefetch(operation, hit_tokens):
-            return True
+            return "settled"
         host_indices, alloc_len = self._allocate_prefetch_host_indices(
             operation, hit_tokens
         )
         if host_indices is None:
-            return self._defer_prefetch_for_host_capacity(
+            self._defer_prefetch_for_host_capacity(
                 operation.handle, max(alloc_len, aux_hit_tokens)
             )
+            return "short"
         if not cache._alloc_prefetch_aux_staging(info, aux_hit_tokens):
             # Same outcome as a KV shortfall: nothing stays staged.
-            cc.append_host_mem_release(host_indices=host_indices)
-            return self._defer_prefetch_for_host_capacity(
+            cc.free_prefetch_host_buffers(operation, host_indices)
+            self._defer_prefetch_for_host_capacity(
                 operation.handle, max(alloc_len, aux_hit_tokens)
             )
-        self._queue_prefetch(operation, info, hit_tokens, host_indices, alloc_len)
-        return True
+            return "short"
+        self._reserve_prefetch(operation, info, hit_tokens, host_indices, alloc_len)
+        return "reserved"
+
+    def dispatch_reserved_prefetch(self, operation: PrefetchOperation) -> None:
+        self._cache.cache_controller.dispatch_prefetch_transfer(operation)
+
+    def rollback_reserved_prefetch(self, operation: PrefetchOperation) -> None:
+        """Undo ``reserve_prefetch``: a peer rank could not allocate, so this
+        rank gives the rows and the anchor pin back and parks too."""
+        cache = self._cache
+        cc = cache.cache_controller
+        request = operation.handle
+        cc.prefetch_tokens_occupied -= operation.buffer_host_occupied_units
+        operation.buffer_host_occupied_units = None
+        cc.free_prefetch_host_buffers(operation, operation.host_indices)
+        operation.host_indices = None
+        cache.ongoing_prefetch[request] = cache.ongoing_prefetch[request]._replace(
+            host_indices=None
+        )
+        self.release_anchor_lock(request)
 
     def _reject_oversized_prefetch(
         self, operation: PrefetchOperation, tokens: int
@@ -1314,7 +1340,7 @@ class BufferModePipeline:
         self._cache._log_storage_prefetch_deferred(tokens, "host_capacity")
         return False
 
-    def _queue_prefetch(
+    def _reserve_prefetch(
         self,
         operation: PrefetchOperation,
         info: _OngoingPrefetch,
@@ -1341,7 +1367,6 @@ class BufferModePipeline:
             host_indices, operation.pool_transfers
         )
         cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
-        cc.dispatch_prefetch_transfer(operation)
 
     def try_lock_anchor(
         self, request: CacheRequestHandle, remaining_full_tokens: int
