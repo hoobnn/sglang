@@ -28,9 +28,9 @@ from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(
-    est_time=140,
-    stage="base-b",
-    runner_config="1-gpu-small",
+    est_time=105,
+    stage="nightly",
+    runner_config="1-gpu-large",
 )
 register_amd_ci(
     est_time=90,
