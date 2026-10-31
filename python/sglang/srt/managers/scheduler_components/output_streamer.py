@@ -121,10 +121,14 @@ class SchedulerOutputStreamer:
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
+        from sglang.srt.managers.cache_controller import StorageCallLanes
+
         storage_backend_type = "none"
         cache_controller = getattr(self.tree_cache, "cache_controller", None)
         if cache_controller and hasattr(cache_controller, "storage_backend"):
             storage_backend = cache_controller.storage_backend
+            if isinstance(storage_backend, StorageCallLanes):
+                storage_backend = storage_backend.backend  # the bounded-call proxy
             if storage_backend is not None:
                 storage_backend_type = type(storage_backend).__name__
         elif self.server_args.enable_lmcache:

@@ -1,5 +1,7 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
+import threading
+import time
 import unittest
 from functools import partial
 from queue import Queue
@@ -1663,6 +1665,120 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
+
+
+class _RecordingLayoutDomain:
+    """Stands in for a pool's shared backing: records the lease calls it gets."""
+
+    def __init__(self):
+        self.acquired = 0
+        self.released = []
+
+    def acquire_layout(self):
+        self.acquired += 1
+
+    def release_layout(self, finish_event=None):
+        self.released.append(finish_event)
+
+
+class _LockedThenReadyFence:
+    """A transfer fence that completes only after a helper thread, started by
+    the first query, has taken the backing's lock (an orphaned storage call
+    resolving page pointers behaves this way)."""
+
+    def __init__(self, backing, pool_name, indices):
+        self._backing = backing
+        self._pool_name = pool_name
+        self._indices = indices
+        self._ready = threading.Event()
+        self.helper = None
+
+    def _resolve_pages_then_finish(self):
+        self._backing.translate_indices(self._pool_name, self._indices)
+        self._ready.set()
+
+    def query(self):
+        if self.helper is None:
+            self.helper = threading.Thread(
+                target=self._resolve_pages_then_finish, daemon=True
+            )
+            self.helper.start()
+        return self._ready.is_set()
+
+    def synchronize(self):
+        while not self.query():
+            time.sleep(0.001)
+
+
+class TestUnifiedHostLayoutLease(CustomTestCase):
+    def test_group_lease_hands_the_finish_event_to_every_shared_domain(self):
+        """The finish event given to the group's lease is what each shared
+        layout domain receives, unchanged, on release; a lease without one
+        releases with None."""
+        full_pool, swa_pool = _build_unified_host_pair(_build_unified_swa_pool())
+        self.addCleanup(full_pool.destroy)
+        self.addCleanup(swa_pool.destroy)
+        group = HostPoolGroup(
+            [
+                PoolEntry(PoolName.KV, full_pool, None, None),
+                PoolEntry(PoolName.SWA, swa_pool, None, None),
+            ]
+        )
+        domains = {id(pool): _RecordingLayoutDomain() for pool in (full_pool, swa_pool)}
+        fence = object()
+        with patch.object(
+            UnifiedPageEnvelopeHostPool,
+            "shared_allocation_domain",
+            property(lambda pool: domains[id(pool)]),
+        ):
+            with group.layout_lease(fence):
+                self.assertEqual(
+                    [(d.acquired, d.released) for d in domains.values()],
+                    [(1, []), (1, [])],
+                )
+            with group.layout_lease():
+                pass
+        for domain in domains.values():
+            self.assertEqual(domain.acquired, 2)
+            self.assertEqual(len(domain.released), 2)
+            self.assertIs(domain.released[0], fence)
+            self.assertIsNone(domain.released[1])
+
+    def test_compaction_waits_for_a_fence_without_holding_the_backing_lock(self):
+        """A pending fence whose completion itself needs the backing's lock
+        must not deadlock the compaction that an allocation triggers."""
+        page_size = 4
+        full_pool, swa_pool = _build_unified_host_pair(
+            _build_unified_swa_pool(page_size)
+        )
+        backing = full_pool.shared_allocation_domain
+        full_indices = full_pool.alloc(full_pool.available_size())
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_pool.alloc(swa_pool.available_size()))
+        # A hole behind the watermark: one more SWA page fits only once the
+        # full side is packed.
+        full_pool.free(full_indices[page_size : 2 * page_size])
+        fence = _LockedThenReadyFence(
+            backing, full_pool.pool_label, full_indices[:page_size]
+        )
+        backing.acquire_layout()
+        backing.release_layout(fence)
+
+        results = []
+        allocating = threading.Thread(
+            target=lambda: results.append(swa_pool.alloc(page_size)), daemon=True
+        )
+        allocating.start()
+        allocating.join(5.0)
+        self.assertFalse(allocating.is_alive())
+        # Registered only once the allocation has returned: a deadlocked
+        # allocation keeps the backing lock that destroy() needs.
+        self.addCleanup(full_pool.destroy)
+        self.addCleanup(swa_pool.destroy)
+        self.assertIsNotNone(fence.helper)
+        fence.helper.join(5.0)
+        self.assertFalse(fence.helper.is_alive())
+        self.assertEqual(results[0].numel(), page_size)
 
 
 class TestUnifiedPageEnvelopeSelection(CustomTestCase):

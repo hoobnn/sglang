@@ -26,6 +26,9 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    _drain_queue,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
@@ -515,9 +518,9 @@ class HybridCacheController(BaseHiCacheController):
             )
             self.pp_prefetch_command_thread.start()
         if self.enable_storage:
-            self.host_mem_release_queue.queue.clear()
+            _drain_queue(self.host_mem_release_queue)
             for release_queue in self.extra_host_mem_release_queues.values():
-                release_queue.queue.clear()
+                _drain_queue(release_queue)
             self.prefetch_tokens_occupied = 0
 
     def allocate_host_transfers(
@@ -1427,7 +1430,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
-        self.backup_queue.put(operation)
+        self._submit_backup(operation)
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
@@ -1616,7 +1619,7 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
-        with self.mem_pool_host.layout_lease():
+        with self.mem_pool_host.layout_lease(self._layout_fence(operation)):
             return self._page_transfer_with_stable_layout(operation)
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
@@ -1707,7 +1710,7 @@ class HybridCacheController(BaseHiCacheController):
         operation.storage_start += trim_tokens
 
     def _page_backup(self, operation):
-        with self.mem_pool_host.layout_lease():
+        with self.mem_pool_host.layout_lease(self._layout_fence(operation)):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
@@ -1789,8 +1792,9 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self._serve(operation)
                 self._page_backup_or_log(operation)
-                self.ack_backup_queue.put(operation)
+                self._ack_backup(operation)
             except Empty:
                 continue
 

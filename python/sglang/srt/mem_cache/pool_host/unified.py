@@ -458,8 +458,11 @@ class _SharedPageEnvelopeHostBacking:
     def _compact(self) -> None:
         events = self._begin_compaction()
         try:
-            for event in events:
-                event.synchronize()
+            # Wait with the backing lock released: a fence may belong to an
+            # orphaned storage call that still resolves page pointers under
+            # this lock. _compacting keeps new leases out meanwhile.
+            while not all(event.query() for event in events):
+                self._layout_condition.wait(0.001)
             for side in self.sides.values():
                 self._compact_side(side)
         finally:

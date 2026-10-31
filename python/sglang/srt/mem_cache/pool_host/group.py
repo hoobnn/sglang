@@ -82,7 +82,10 @@ class HostPoolGroup:
         return self.get_entry(name).host_pool
 
     @contextmanager
-    def layout_lease(self):
+    def layout_lease(self, finish_event=None):
+        """Hold the host layout stable for the block; ``finish_event`` (an
+        object with ``query()``/``synchronize()``) keeps a compaction waiting
+        after the release until the work the block started has returned."""
         domains = shared_host_layout_domains(entry.host_pool for entry in self.entries)
         for domain in domains:
             domain.acquire_layout()
@@ -90,7 +93,7 @@ class HostPoolGroup:
             yield
         finally:
             for domain in reversed(domains):
-                domain.release_layout()
+                domain.release_layout(finish_event)
 
     def get_page_buffer_element_size(self, split_factor: int = 1):
         anchor_pool = self.anchor_entry.host_pool

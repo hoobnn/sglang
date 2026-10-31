@@ -5,7 +5,8 @@ controller) only performs I/O and records each operation's *local* outcome on
 the operation. Once per scheduler tick the engine builds one integer row per
 pending operation, hands the rows to an agreement strategy, and publishes the
 agreed outcomes in submission order into the controller queues the stock
-storage drain consumes. No collective runs on a worker thread and no worker
+storage drain consumes (a finished transfer publishes past an earlier one whose
+rows a worker or an orphaned call still holds; queries stay strictly FIFO). No collective runs on a worker thread and no worker
 ever waits for a peer rank: a slow or failed backend call on one rank delays
 that operation only, and nothing can strand the pipeline behind a
 worker-thread collective that timed out.
@@ -370,14 +371,17 @@ class StorageAgreementEngine:
             if cut is not None and values[-1] < 0:
                 cut(operation)
             if state == TRANSFER_PENDING:
-                break  # a rank's worker still owns the host rows
+                # A worker (or an orphaned call) still owns these rows. The
+                # agreed state names the operation on every rank, so later
+                # transfers need not wait behind it.
+                continue
             if state == TRANSFER_FATAL:
                 raise RuntimeError(
                     "HiCache storage worker is gone on a rank; request "
                     f"{operation.request_id} and every later storage operation "
                     "can no longer be agreed across ranks"
                 )
-            self.transfers.popleft()
+            self.transfers.remove(operation)
             pool_hits = None
             if operation.pool_transfers:
                 pool_hits = {

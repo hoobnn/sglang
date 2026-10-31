@@ -18,11 +18,13 @@ from contextlib import nullcontext
 from datetime import timedelta
 from queue import Queue
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import Mock
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.managers.cache_controller import StorageCallLanes, _drain_queue
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -46,7 +48,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 PAGE = 2
 TOKENS = list(range(8))  # four pages
@@ -361,6 +363,20 @@ class TestStorageAgreementTransfers(unittest.TestCase):
         self.assertTrue(plain.pool_transfers_done)
         self.assertEqual(plain.pool_storage_result.extra_pool_hit_pages, {})
 
+    def test_finished_transfer_publishes_past_a_pending_one(self):
+        """A transfer whose rows a slow (orphaned) call still holds does not
+        hold back later transfers: the agreed state names the operation."""
+        local, peer = _ranks()
+        for rank in (local, peer):
+            slow, fast = _operation("slow"), _operation("fast")
+            rank.engine.register_transfer(slow)
+            rank.engine.register_transfer(fast)
+            fast.publish_local_transfer_progress(8)
+            fast.mark_transfer_finished()
+        self.assertEqual(local.tick(), (0, 1))
+        self.assertEqual(local.acks[0][0].request_id, "fast")
+        self.assertEqual([op.request_id for op in local.engine.transfers], ["slow"])
+
 
 class TestAgreedHitReservations(unittest.TestCase):
     """The hit drain reserves locally, agrees the outcomes in one MIN, and only
@@ -595,19 +611,40 @@ class TestAgreedHitReservations(unittest.TestCase):
             self._drain(cache, 1)
 
 
+class TestStorageCallLanes(unittest.TestCase):
+    def test_bound_must_be_positive_and_finite(self):
+        for bad in (0, -1.0, float("inf"), float("nan"), None):
+            with self.assertRaises(ValueError):
+                StorageCallLanes(object(), bad)
+
+    def test_backend_timeout_error_is_a_failed_call_not_an_orphan(self):
+        class _Raises:
+            def batch_exists(self, hashes, extra_info=None):
+                raise TimeoutError("client timeout")
+
+        lanes = StorageCallLanes(_Raises(), 5.0)
+        with self.assertRaisesRegex(TimeoutError, "client timeout"):
+            lanes.batch_exists(CHAIN)
+        self.assertEqual(lanes.orphaned_calls, 0)
+        self.assertEqual(lanes.wait_idle(0), 0)
+
+
 # ---------------------------------------------------------------- two ranks
 
 
 class _HoldingBackend:
-    """Every call reports all pages present; the first query and the first
-    read each block on an event when asked to."""
+    """Every call reports all pages present; the first query, the first read
+    and the first write each block on an event when asked to."""
 
     def __init__(self, hold_query: bool, hold_get: bool):
         self.query_hold = threading.Event()
         self.get_hold = threading.Event()
-        self.hold_query, self.hold_get = hold_query, hold_get
+        self.set_hold = threading.Event()
+        self.hold_query, self.hold_get, self.hold_set = hold_query, hold_get, False
         self.queries = 0
         self.gets = 0
+        self.sets = 0
+        self.closed = False
 
     def batch_exists(self, hashes, extra_info=None):
         self.queries += 1
@@ -621,36 +658,57 @@ class _HoldingBackend:
             self.get_hold.wait()
         return [True] * len(hashes)
 
+    def batch_set_v1(self, hashes, host_indices, extra_info=None):
+        self.sets += 1
+        if self.hold_set and self.sets == 1:
+            self.set_hold.wait()
+        return [True] * len(hashes)
+
+    def close(self):
+        self.closed = True
+
 
 def _controller(backend) -> HybridCacheController:
     """The real query and transfer workers over a scripted backend; agreement
     is the scheduler's, so the workers only record local outcomes."""
     cc = HybridCacheController.__new__(HybridCacheController)
     cc.page_size = PAGE
+    cc.enable_storage = True
     cc.storage_backend = backend
+    cc.storage_backend_type = "scripted"
+    cc.storage_config = SimpleNamespace(is_storage_writer=True)
+    cc.storage_calls = None
     cc.scheduler_agrees_storage = True
     cc.on_prefetch_dispatched = None
     cc.storage_stop_event = threading.Event()
+    cc._inflight_lock = threading.Lock()
+    cc._worker_transfers, cc._worker_backups = set(), {}
     cc.prefetch_queue = Queue()
+    cc.backup_queue = Queue()
     cc.prefetch_buffer = Queue()
+    cc.prefetch_sync_queue = Queue()
     cc.prefetch_hit_queue = Queue()
     cc.ack_prefetch_queue = Queue()
     cc.ack_backup_queue = Queue()
     cc.host_mem_release_queue = Queue()
     cc.extra_host_mem_release_queues = {}
-    cc.ack_write_queue = []
-    cc.ack_load_queue = []
+    cc.write_queue, cc.load_queue = [], []
+    cc.ack_write_queue, cc.ack_load_queue = [], []
+    cc.prefetch_hits_sync_groups = cc.prefetch_completion_sync_groups = []
+    cc.prefetch_tokens_occupied = 0
+    # The hybrid reset/detach path also parks the PP ticket machinery.
+    cc.pp_prefetch_command_thread = cc.pp_prefetch_command_group = None
+    cc.pp_prefetch_state_lock = threading.Lock()
+    cc.pp_prefetch_states, cc.pp_prefetch_decisions = {}, {}
     cc.start_writing = Mock()
     cc.page_get_func = cc._page_get_zero_copy
-    cc.mem_pool_host = SimpleNamespace(layout_lease=nullcontext, page_size=PAGE)
-    cc.prefetch_sync_thread = None
-    cc.backup_thread = None
-    cc.prefetch_thread = threading.Thread(target=cc.prefetch_thread_func, daemon=True)
-    cc.prefetch_io_aux_thread = threading.Thread(
-        target=cc.prefetch_io_aux_func, daemon=True
+    cc.page_set_func = cc._page_set_zero_copy
+    cc.mem_pool_host = SimpleNamespace(
+        layout_lease=lambda fence=None: nullcontext(), page_size=PAGE
     )
-    cc.prefetch_thread.start()
-    cc.prefetch_io_aux_thread.start()
+    cc.prefetch_sync_thread = None
+    cc.prefetch_thread = cc.prefetch_io_aux_thread = cc.backup_thread = None
+    cc._spawn_storage_threads()
     return cc
 
 
@@ -723,8 +781,18 @@ def _same_on_every_rank(snapshot):
     return snapshots[0]
 
 
+def _gathered(snapshot) -> list:
+    snapshots = [None] * dist.get_world_size()
+    dist.all_gather_object(snapshots, snapshot)
+    return snapshots
+
+
+def _drain_kw(cache) -> dict:
+    return cache._drain_storage_control_queues_impl.call_args.kwargs
+
+
 def _drain_counts(cache) -> tuple[int, int]:
-    kwargs = cache._drain_storage_control_queues_impl.call_args.kwargs
+    kwargs = _drain_kw(cache)
     return kwargs["n_storage_hit"], kwargs["n_ack_prefetch"]
 
 
@@ -811,6 +879,149 @@ def _slow_backend_body(rank: int) -> None:
         _same_on_every_rank(ack.completed_tokens)
     cache.prefetch_stop_policy = "wait_complete"
 
+    def _bound(timeout_s):
+        cc.storage_backend = cc.storage_calls = StorageCallLanes(backend, timeout_s)
+
+    def _unbound():
+        cc.storage_backend, cc.storage_calls = backend, None
+
+    def _wait_until(predicate, budget_s=5.0):
+        deadline = time.monotonic() + budget_s
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert predicate()
+
+    # Orphan phase: calls are bounded on both ranks; rank 1 holds the read of
+    # the first operation past the bound, so its worker orphans the call and
+    # serves the next operation. That one publishes first on every rank; the
+    # held one stays unfinished (its rows quarantined) until the orphan
+    # returns, then publishes with the agreed prefix (0: it failed on rank 1).
+    _bound(0.3)
+    held = _submit(cache, "held")
+    behind = _submit(cache, "behind")
+    _tick_until(cache, lambda hits, acks: cc.prefetch_hit_queue.qsize() == 2)
+    cc.prefetch_hit_queue.get_nowait()
+    cc.prefetch_hit_queue.get_nowait()
+    backend.hold_get, backend.gets = rank == 1, 0
+    backend.get_hold.clear()
+    _dispatch(cache, held)
+    _dispatch(cache, behind)
+    if rank == 1:
+        threading.Timer(HOLD_S, backend.get_hold.set).start()
+    tick, _, elapsed = _tick_until(cache, lambda hits, acks: acks > 0)
+    ack = cc.ack_prefetch_queue.get_nowait()
+    assert ack.operation is behind, ack.operation.request_id
+    assert elapsed < HOLD_S * 0.9, elapsed  # did not wait behind the held call
+    _same_on_every_rank((tick, ack.completed_tokens))
+    assert cache.storage_engine.pending_transfers() == 1
+    if rank == 1:
+        assert not held.local_transfer_progress().finished
+        assert not cc.storage_calls.fence(held).query()
+    _tick_until(cache, lambda hits, acks: acks > 0)
+    ack = cc.ack_prefetch_queue.get_nowait()
+    assert ack.operation is held
+    _same_on_every_rank(ack.completed_tokens)
+    assert ack.completed_tokens == 0
+    assert held not in cc._worker_transfers
+    assert cc.storage_calls.fence(held).query()
+    assert cc.storage_workers_alive()
+    _unbound()
+
+    # Backup phase: acks leave in submission order. Rank 1 holds the first
+    # write past the bound: no rank acks anything while it runs (the count
+    # MIN hides rank 0's ready acks), then both ack [a, b] in the same tick.
+    _bound(0.3)
+    backend.hold_set, backend.sets = rank == 1, 0
+    backend.set_hold.clear()
+    rows = torch.arange(len(TOKENS))
+    a = cc.write_storage(rows, list(TOKENS), hash_value=list(CHAIN))
+    b = cc.write_storage(rows, list(TOKENS), hash_value=list(CHAIN))
+    if rank == 1:
+        threading.Timer(HOLD_S, backend.set_hold.set).start()
+    start = time.monotonic()
+    while time.monotonic() - start < HOLD_S * 0.5:
+        cache.check_hicache_events()
+        assert _drain_kw(cache)["n_backup"] == 0
+        time.sleep(0.02)
+    _tick_until(cache, lambda hits, acks: _drain_kw(cache)["n_backup"] > 0)
+    assert _drain_kw(cache)["n_backup"] == 2
+    acked = _drain_queue(cc.ack_backup_queue)
+    _same_on_every_rank([op.id for op in acked])
+    assert [op.id for op in acked] == [a, b]
+    assert acked[0].completed_tokens == (0 if rank == 1 else len(TOKENS))
+    assert not cc._worker_backups
+    _unbound()
+
+    # Reset phase: a bounded read is held on rank 1 and a second transfer is
+    # queued behind it. Reset drops the queued one, cuts the running one and
+    # waits for the orphan; the workers are neither joined nor restarted.
+    dist.barrier()
+    _bound(0.6)  # wide enough that the drain always beats the worker to b
+    a = _submit(cache, "reset-a")
+    b = _submit(cache, "reset-b")
+    _tick_until(cache, lambda hits, acks: cc.prefetch_hit_queue.qsize() == 2)
+    cc.prefetch_hit_queue.get_nowait()
+    cc.prefetch_hit_queue.get_nowait()
+    backend.hold_get, backend.gets = rank == 1, 0
+    backend.get_hold.clear()
+    _dispatch(cache, a)
+    if rank == 1:
+        _wait_until(lambda: backend.gets == 1)
+    _dispatch(cache, b)
+    if rank == 1:
+        threading.Timer(HOLD_S, backend.get_hold.set).start()
+    t0 = time.monotonic()
+    cache.ongoing_prefetch.clear()
+    cache.storage_engine.reset()
+    cc.reset()
+    if rank == 1:
+        assert time.monotonic() - t0 >= HOLD_S * 0.5
+        assert backend.gets == 1  # b was dropped, never read
+    assert b.local_transfer_progress().finished
+    assert not cc._worker_transfers and not cc._worker_backups
+    assert cc.prefetch_buffer.empty()
+    assert cc.storage_workers_alive()
+    assert not cc.storage_stop_event.is_set()
+    assert cc.prefetch_tokens_occupied == 0
+    _unbound()
+    dist.barrier()
+    fresh = _submit(cache, "fresh")
+    _tick_until(cache, lambda hits, acks: hits > 0)
+    assert cc.prefetch_hit_queue.get_nowait() is fresh
+    _dispatch(cache, fresh)
+    _tick_until(cache, lambda hits, acks: acks > 0)
+    ack = cc.ack_prefetch_queue.get_nowait()
+    assert ack.operation is fresh
+    _same_on_every_rank(ack.completed_tokens)
+
+    # Quiesce deadline: rank 1 holds a read with no timer. With the wait cut
+    # to bound + 1 s, reset raises there (naming the orphan) and returns on
+    # rank 0; once the call returns a second reset succeeds.
+    _bound(0.3)
+    a = _submit(cache, "outlive")
+    _tick_until(cache, lambda hits, acks: hits > 0)
+    cc.prefetch_hit_queue.get_nowait()
+    backend.hold_get, backend.gets = rank == 1, 0
+    backend.get_hold.clear()
+    _dispatch(cache, a)
+    if rank == 1:
+        _wait_until(lambda: backend.gets == 1)
+    raised = False
+    with mock.patch("sglang.srt.managers.cache_controller.STORAGE_QUIESCE_WAIT_S", 0.2):
+        try:
+            cache.ongoing_prefetch.clear()
+            cache.storage_engine.reset()
+            cc.reset()
+        except RuntimeError as e:
+            raised = "1 behind orphaned calls" in str(e)
+    assert _gathered(raised) == [False, True]
+    backend.get_hold.set()
+    _wait_until(lambda: a.local_transfer_progress().finished)
+    cc.reset()
+    assert not cc._worker_transfers
+    _unbound()
+    dist.barrier()
+
     # Divergent submission: only rank 0 registers a query. The count exchange
     # catches it on every rank before the agreement collective could hang.
     if rank == 0:
@@ -853,8 +1064,71 @@ def _slow_backend_body(rank: int) -> None:
     assert cc.prefetch_hit_queue.get_nowait() is fourth
     _same_on_every_rank((third.storage_hit_count, fourth.storage_hit_count))
     assert third.storage_hit_count == len(TOKENS) and fourth.storage_hit_count == 0
-    cc.prefetch_queue.put(None)
-    cc.prefetch_buffer.put(None)
+
+    # Reset after a stop: the workers exited on the stop event; reset is not
+    # in place then (nothing alive to keep): it joins them, clears the event,
+    # resets the ledgers and respawns, as main did.
+    cc.prefetch_thread = real_query
+    cache.ongoing_prefetch.clear()
+    cache.storage_engine.reset()
+    cc.reset()
+    assert cc.storage_workers_alive() and not cc.storage_stop_event.is_set()
+    assert not any(t.is_alive() for t in (real_query, gone))
+    dist.barrier()
+
+    # Detach phase, first with an orphaned query (no rows held, so quiesce
+    # passes and wait_idle refuses: the backend is closed afterwards), then
+    # with an orphaned read on both ranks. Detach raises and changes nothing:
+    # the backend stays attached and open, the workers alive, the held row
+    # unpublished; once the calls return the retry detaches cleanly.
+    _bound(0.3)
+    backend.hold_query, backend.queries = True, 0
+    backend.query_hold.clear()
+    asked = _submit(cache, "detach-query")
+    _wait_until(lambda: backend.queries == 1)
+    _tick_until(cache, lambda hits, acks: hits > 0)  # the bound made it a miss
+    assert cc.prefetch_hit_queue.get_nowait() is asked
+    assert asked.storage_hit_count == 0
+    raised = False
+    with mock.patch("sglang.srt.managers.cache_controller.STORAGE_QUIESCE_WAIT_S", 0.2):
+        try:
+            cc.detach_storage_backend()
+        except RuntimeError as e:
+            raised = "detach aborted" in str(e)
+    assert raised, "detach under an orphaned query did not raise"
+    assert cc.enable_storage and not backend.closed and cc.storage_workers_alive()
+    backend.query_hold.set()
+    _wait_until(lambda: cc.storage_calls.wait_idle(0) == 0)
+    backend.hold_query = False
+    held = _submit(cache, "detach-held")
+    _tick_until(cache, lambda hits, acks: hits > 0)
+    cc.prefetch_hit_queue.get_nowait()
+    backend.hold_get, backend.gets = True, 0
+    backend.get_hold.clear()
+    _dispatch(cache, held)
+    _wait_until(lambda: backend.gets == 1)
+    time.sleep(0.4)  # past the bound: the read runs orphaned on both ranks
+    raised = False
+    with mock.patch("sglang.srt.managers.cache_controller.STORAGE_QUIESCE_WAIT_S", 0.2):
+        try:
+            cc.detach_storage_backend()
+        except RuntimeError as e:
+            raised = "1 behind orphaned calls" in str(e)
+    assert raised, "detach under an orphaned read did not raise"
+    assert cc.enable_storage and not backend.closed
+    assert cc.storage_workers_alive() and not cc.storage_stop_event.is_set()
+    cache.check_hicache_events()
+    assert _drain_counts(cache)[1] == 0
+    assert held in cc._worker_transfers
+    backend.get_hold.set()
+    _wait_until(lambda: held not in cc._worker_transfers)
+    cc.detach_storage_backend()
+    assert backend.closed and cc.storage_calls is None and not cc.enable_storage
+    assert not any(
+        t is not None and t.is_alive()
+        for t in (cc.prefetch_thread, cc.prefetch_io_aux_thread, cc.backup_thread)
+    )
+    assert cc.storage_calls is None  # nothing keeps the bounded proxy alive
 
 
 def _rank_main(rank: int, rendezvous: str) -> None:

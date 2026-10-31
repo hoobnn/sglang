@@ -5758,6 +5758,7 @@ class Scheduler(
                 "Hierarchical cache is disabled", page_size=self.page_size
             )
 
+        from sglang.srt.managers.cache_controller import StorageCallLanes
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
@@ -5771,6 +5772,8 @@ class Scheduler(
                 "HiCache controller is not attached", page_size=self.page_size
             )
         storage_backend = controller.storage_backend
+        if isinstance(storage_backend, StorageCallLanes):
+            storage_backend = storage_backend.backend  # the bounded-call proxy
         if not isinstance(storage_backend, MooncakeStore):
             return disabled_l3_layout(
                 "Mooncake storage is not attached",
